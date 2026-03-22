@@ -236,6 +236,94 @@ func (idx *InvertedIndex) Index(docID int, document string) {
 	idx.TotalTerms += int64(len(tokens))
 }
 
+func (idx *InvertedIndex) UpsertDocument(docID int, document string) {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	_, existed := idx.DocStats[docID]
+	if existed {
+		idx.deleteDocumentUnlocked(docID)
+		idx.indexDocumentUnlocked(docID, document)
+	} else {
+		idx.indexDocumentUnlocked(docID, document)
+	}
+}
+
+// deleteDocumentUnlocked removes docID from postings, bitmaps, and BM25 stats.
+// Caller must hold idx.mu. Returns false if the document was not indexed.
+func (idx *InvertedIndex) deleteDocumentUnlocked(docID int) bool {
+	stats, ok := idx.DocStats[docID]
+	if !ok {
+		return false
+	}
+
+	for term := range stats.TermFreqs {
+		idx.removeTermPostingsForDoc(term, docID)
+	}
+
+	idx.TotalDocs--
+	idx.TotalTerms -= int64(stats.Length)
+	delete(idx.DocStats, docID)
+	return true
+}
+
+// indexDocumentUnlocked adds a new document to the index. The caller must hold idx.mu.
+// revision is stored in DocStats for synchronization; use 0 when not tracking versions.
+func (idx *InvertedIndex) indexDocumentUnlocked(docID int, document string) {
+	tokens := Analyze(document)
+
+	docStats := DocumentStats{
+		DocID:     docID,
+		Length:    len(tokens),
+		TermFreqs: make(map[string]int),
+	}
+
+	for position, token := range tokens {
+		idx.indexToken(token, docID, position)
+		docStats.TermFreqs[token]++
+	}
+
+	idx.DocStats[docID] = docStats
+	idx.TotalDocs++
+	idx.TotalTerms += int64(len(tokens))
+}
+
+func (idx *InvertedIndex) removeTermPostingsForDoc(term string, docID int) {
+	skipList, exists := idx.PostingsList[term]
+	if !exists {
+		return
+	}
+
+	var toRemove []Position
+	cur := skipList.Head
+	for cur != nil && cur.Tower[0] != nil {
+		cur = cur.Tower[0]
+		if cur.Key.DocumentID == docID {
+			toRemove = append(toRemove, cur.Key)
+		} else if cur.Key.DocumentID > docID {
+			break
+		}
+	}
+
+	for _, p := range toRemove {
+		skipList.Delete(p)
+	}
+
+	if skipList.Head == nil || skipList.Head.Tower[0] == nil {
+		delete(idx.PostingsList, term)
+		delete(idx.DocBitmaps, term)
+		return
+	}
+
+	idx.PostingsList[term] = skipList
+	if bm := idx.DocBitmaps[term]; bm != nil {
+		bm.Remove(uint32(docID))
+		if bm.IsEmpty() {
+			delete(idx.DocBitmaps, term)
+		}
+	}
+}
+
 // indexToken adds a single token occurrence to the index (HYBRID STORAGE)
 //
 // HOW IT WORKS:
