@@ -44,11 +44,6 @@ var (
 	ErrNoPostingList = errors.New("no posting list exists for token")
 	ErrNoNextElement = errors.New("no next element found")
 	ErrNoPrevElement = errors.New("no previous element found")
-
-	// ErrRevisionStale is returned when UpsertDocumentAtRevision is called with a revision
-	// older than or equal to the revision already stored for that document (duplicate
-	// events with the same revision return nil instead).
-	ErrRevisionStale = errors.New("revision is older than indexed revision")
 )
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -107,9 +102,6 @@ type DocumentStats struct {
 	DocID     int            // Document identifier
 	Length    int            // Number of terms in the document
 	TermFreqs map[string]int // How many times each term appears
-	// Revision is an optional monotonic sequence from the source of truth (e.g. DB row version).
-	// 0 means unset (legacy Index path or data loaded from v1 snapshots).
-	Revision uint64
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -171,8 +163,7 @@ func NewInvertedIndex() *InvertedIndex {
 // INDEXING: Building the Search Index
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// Index adds a document to the inverted index without removing prior postings for docID.
-// If docID might already be indexed, use UpsertDocument or UpsertDocumentAtRevision instead.
+// Index adds a document to the inverted index
 //
 // STEP-BY-STEP EXAMPLE:
 // ----------------------
@@ -217,30 +208,29 @@ func NewInvertedIndex() *InvertedIndex {
 //
 // This metadata enables BM25 scoring later during search.
 func (idx *InvertedIndex) Index(docID int, document string) {
-	idx.mu.Lock()
-	defer idx.mu.Unlock()
+	idx.mu.Lock()         // Acquire lock - only one goroutine can index at a time
+	defer idx.mu.Unlock() // Release lock when function returns (even if it panics)
 
 	slog.Info("indexing document", slog.Int("docID", docID))
-	idx.indexDocumentUnlocked(docID, document, 0)
-}
 
-// indexDocumentUnlocked adds a new document to the index. The caller must hold idx.mu.
-// revision is stored in DocStats for synchronization; use 0 when not tracking versions.
-func (idx *InvertedIndex) indexDocumentUnlocked(docID int, document string, revision uint64) {
+	// STEP 1: Break document into searchable tokens
+	// Example: "The Quick Brown Fox!" → ["quick", "brown", "fox"]
 	tokens := Analyze(document)
 
+	// STEP 2: Initialize document statistics
 	docStats := DocumentStats{
 		DocID:     docID,
 		Length:    len(tokens),
 		TermFreqs: make(map[string]int),
-		Revision:  revision,
 	}
 
+	// STEP 3: Index each token and track term frequencies
 	for position, token := range tokens {
 		idx.indexToken(token, docID, position)
 		docStats.TermFreqs[token]++
 	}
 
+	// STEP 4: Update global statistics
 	idx.DocStats[docID] = docStats
 	idx.TotalDocs++
 	idx.TotalTerms += int64(len(tokens))
