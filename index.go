@@ -6,25 +6,21 @@
 // An inverted index is like the index at the back of a book, but for search engines.
 //
 // Example: Given these documents:
-//   Doc 1: "the quick brown fox"
-//   Doc 2: "the lazy dog"
-//   Doc 3: "quick brown dogs"
+//
+//	Doc 1: "the quick brown fox"
+//	Doc 2: "the lazy dog"
+//	Doc 3: "quick brown dogs"
 //
 // The inverted index would look like:
-//   "quick"  → [Doc1:Pos1, Doc3:Pos0]
-//   "brown"  → [Doc1:Pos2, Doc3:Pos1]
-//   "fox"    → [Doc1:Pos3]
-//   "lazy"   → [Doc2:Pos1]
-//   "dog"    → [Doc2:Pos2]
-//   "dogs"   → [Doc3:Pos2]
 //
-// This allows us to:
-// 1. Find documents containing a word instantly (without scanning all docs)
-// 2. Find phrases by checking if word positions are consecutive
-// 3. Rank results by how close words appear to each other (proximity)
+//	"quick"  → [Doc1:Pos1, Doc3:Pos0]
+//	"brown"  → [Doc1:Pos2, Doc3:Pos1]
+//	"fox"    → [Doc1:Pos3]
+//	"lazy"   → [Doc2:Pos1]
+//	"dog"    → [Doc2:Pos2]
+//	"dogs"   → [Doc3:Pos2]
 //
 // ═══════════════════════════════════════════════════════════════════════════════
-
 package iskra
 
 import (
@@ -38,8 +34,6 @@ import (
 // ═══════════════════════════════════════════════════════════════════════════════
 // ERROR DEFINITIONS
 // ═══════════════════════════════════════════════════════════════════════════════
-// We define errors as package-level variables so they can be compared with ==
-// This is a Go best practice for error handling.
 var (
 	ErrNoPostingList = errors.New("no posting list exists for token")
 	ErrNoNextElement = errors.New("no next element found")
@@ -48,39 +42,6 @@ var (
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // BM25 RANKING SYSTEM
-// ═══════════════════════════════════════════════════════════════════════════════
-// BM25 (Best Matching 25) is a ranking function used by search engines to estimate
-// the relevance of documents to a given search query.
-//
-// WHY BM25?
-// ---------
-// 1. Industry standard: Used by Elasticsearch, Solr, Lucene
-// 2. Accounts for document length (longer docs don't unfairly rank higher)
-// 3. Accounts for term frequency saturation (10 vs 100 occurrences matter less)
-// 4. Accounts for term rarity (rare terms are more significant)
-//
-// BM25 FORMULA:
-// -------------
-// For each term in the query:
-//   score += IDF(term) * (TF * (k1 + 1)) / (TF + k1 * (1 - b + b * (docLen / avgDocLen)))
-//
-// Where:
-//   IDF = Inverse Document Frequency (how rare is this term?)
-//   TF = Term Frequency (how often does term appear in this doc?)
-//   k1 = Term frequency saturation parameter (typically 1.2-2.0)
-//   b = Length normalization parameter (typically 0.75)
-//   docLen = Length of this document
-//   avgDocLen = Average document length in the corpus
-//
-// EXAMPLE:
-// --------
-// Query: "machine learning"
-// Doc A: 100 words, contains "machine" 3 times, "learning" 2 times
-// Doc B: 500 words, contains "machine" 5 times, "learning" 8 times
-//
-// Despite Doc B having more occurrences, Doc A might score higher because:
-// 1. Doc A is shorter (length normalization)
-// 2. The density of query terms is higher in Doc A
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // BM25Parameters holds the tuning parameters for BM25 algorithm
@@ -92,45 +53,63 @@ type BM25Parameters struct {
 // DefaultBM25Parameters returns the standard BM25 parameters
 func DefaultBM25Parameters() BM25Parameters {
 	return BM25Parameters{
-		K1: 1.5,  // Moderate term frequency saturation
-		B:  0.75, // Standard length normalization
+		K1: 1.5,
+		B:  0.75,
 	}
 }
 
-// DocumentStats stores statistics about a single document
+// DocumentStats stores statistics about a single document.
+// DocID is uint32 to match the index-wide convention.
 type DocumentStats struct {
-	DocID     int            // Document identifier
+	DocID     uint32         // Document identifier
 	Length    int            // Number of terms in the document
 	TermFreqs map[string]int // How many times each term appears
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// INDEX OPTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// IndexOption is a functional option for Index / Upsert calls.
+type IndexOption func(*indexOptions)
+
+type indexOptions struct {
+	disableAnalyzer bool
+}
+
+// WithoutAnalyzer disables text analysis for a single Index/Upsert call.
+// The document is stored as a single token exactly as provided — no lowercasing,
+// no stop-word removal, no stemming.
+//
+// Useful when documents are already pre-processed, contain structured identifiers,
+// or when you need exact-match behaviour without any normalization.
+//
+// Example:
+//
+//	idx.Index(42, "SKU-9021-XL", iskra.WithoutAnalyzer())
+//	idx.Upsert(42, "SKU-9021-XL", iskra.WithoutAnalyzer())
+func WithoutAnalyzer() IndexOption {
+	return func(o *indexOptions) {
+		o.disableAnalyzer = true
+	}
+}
+
+func applyIndexOptions(opts []IndexOption) indexOptions {
+	o := indexOptions{}
+	for _, opt := range opts {
+		opt(&o)
+	}
+	return o
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // CORE DATA STRUCTURE: InvertedIndex with HYBRID STORAGE
 // ═══════════════════════════════════════════════════════════════════════════════
-// The InvertedIndex uses a hybrid approach for maximum efficiency:
-//
-// Architecture:
-//
-//	InvertedIndex
-//	├── DocBitmaps: map[string]*roaring.Bitmap  (DOCUMENT-LEVEL)
-//	│   ├── "quick" → Bitmap of document IDs [1, 3, 5, ...]
-//	│   ├── "brown" → Bitmap of document IDs [1, 2, 7, ...]
-//	│   └── "fox"   → Bitmap of document IDs [3, 5, ...]
-//	├── PostingsList: map[string]SkipList       (POSITION-LEVEL)
-//	│   ├── "quick" → SkipList of exact positions
-//	│   ├── "brown" → SkipList of exact positions
-//	│   └── "fox"   → SkipList of exact positions
-//	└── mu: mutex for thread safety
-//
-// Why Hybrid Storage?
-//   - Roaring Bitmaps: Lightning-fast for document-level operations (AND, OR, NOT)
-//     10-100x memory compression, O(1) boolean operations
-//   - Skip Lists: Essential for position-based queries (phrases, proximity)
-//
-// This gives us the best of both worlds!
-// ═══════════════════════════════════════════════════════════════════════════════
+
+// InvertedIndex is the main search index.
+// DocStats and all DocID references use uint32.
 type InvertedIndex struct {
-	mu sync.Mutex // Protects against concurrent access
+	mu sync.Mutex
 
 	// DOCUMENT-LEVEL STORAGE (for fast document lookups and boolean queries)
 	DocBitmaps map[string]*roaring.Bitmap // Term → Bitmap of document IDs
@@ -138,21 +117,19 @@ type InvertedIndex struct {
 	// POSITION-LEVEL STORAGE (for phrase search, proximity)
 	PostingsList map[string]SkipList // Term → Positions
 
-	// ===============================
-	// BM25 INDEXING DATA STRUCTURES
-	// ===============================
-	DocStats   map[int]DocumentStats // DocID → statistics
-	TotalDocs  int                   // Total number of indexed documents
-	TotalTerms int64                 // Total number of terms across all docs
-	BM25Params BM25Parameters        // BM25 tuning parameters
+	// BM25 data
+	DocStats   map[uint32]DocumentStats // DocID → statistics
+	TotalDocs  int
+	TotalTerms int64
+	BM25Params BM25Parameters
 }
 
-// NewInvertedIndex creates a new empty inverted index with hybrid storage and BM25 support
+// NewInvertedIndex creates a new empty inverted index
 func NewInvertedIndex() *InvertedIndex {
 	return &InvertedIndex{
-		DocBitmaps:   make(map[string]*roaring.Bitmap), // Initialize document-level bitmaps
-		PostingsList: make(map[string]SkipList),        // Initialize position-level skip lists
-		DocStats:     make(map[int]DocumentStats),
+		DocBitmaps:   make(map[string]*roaring.Bitmap),
+		PostingsList: make(map[string]SkipList),
+		DocStats:     make(map[uint32]DocumentStats),
 		TotalDocs:    0,
 		TotalTerms:   0,
 		BM25Params:   DefaultBM25Parameters(),
@@ -160,135 +137,51 @@ func NewInvertedIndex() *InvertedIndex {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// INDEXING: Building the Search Index
+// INDEXING
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// Index adds a document to the inverted index
+// Index adds a document to the inverted index.
 //
-// STEP-BY-STEP EXAMPLE:
-// ----------------------
-// Input: docID=1, document="The quick brown fox"
+// By default the full analysis pipeline is applied (tokenization, lowercasing,
+// stop-word removal, stemming). Pass WithoutAnalyzer() to skip all analysis and
+// store the document as a single raw token.
 //
-// Step 1: Tokenization
+// Example (default):
 //
-//	analyzer.Analyze() converts to: ["quick", "brown", "fox"]
-//	(Note: "The" is removed as a stop word, and words are lowercased)
+//	idx.Index(1, "The Quick Brown Fox")
 //
-// Step 2: For each token, record its position
+// Example (raw, no analysis):
 //
-//	Token "quick" at position 0 in document 1
-//	Token "brown" at position 1 in document 1
-//	Token "fox"   at position 2 in document 1
-//
-// Step 3: Update the index
-//
-//	PostingsList["quick"] ← add Position{DocID:1, Offset:0}
-//	PostingsList["brown"] ← add Position{DocID:1, Offset:1}
-//	PostingsList["fox"]   ← add Position{DocID:1, Offset:2}
-//
-// Why record positions and not just document IDs?
-// - Positions let us do phrase search ("brown fox" requires consecutive positions)
-// - Positions let us rank by proximity (closer words = more relevant)
-//
-// Thread Safety Note:
-// - We lock the entire indexing operation to prevent race conditions
-// - If we didn't lock, two goroutines could corrupt the data structure
-// ═══════════════════════════════════════════════════════════════════════════════
-// BM25 INDEXING
-// ═══════════════════════════════════════════════════════════════════════════════
-// Index also enriches the index with BM25 statistics
-//
-// WHAT'S DIFFERENT WITH BM25:
-// ---------------------------
-// In addition to building the inverted index, we now track:
-// 1. Document length (number of terms)
-// 2. Term frequencies per document (how many times each term appears)
-// 3. Total number of documents (for IDF calculation)
-// 4. Total number of terms (for average document length)
-//
-// This metadata enables BM25 scoring later during search.
-func (idx *InvertedIndex) Index(docID int, document string) {
-	idx.mu.Lock()         // Acquire lock - only one goroutine can index at a time
-	defer idx.mu.Unlock() // Release lock when function returns (even if it panics)
+//	idx.Index(1, "SKU-9021-XL", iskra.WithoutAnalyzer())
+func (idx *InvertedIndex) Index(docID uint32, document string, opts ...IndexOption) {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
 
-	slog.Info("indexing document", slog.Int("docID", docID))
-
-	// STEP 1: Break document into searchable tokens
-	// Example: "The Quick Brown Fox!" → ["quick", "brown", "fox"]
-	tokens := Analyze(document)
-
-	// STEP 2: Initialize document statistics
-	docStats := DocumentStats{
-		DocID:     docID,
-		Length:    len(tokens),
-		TermFreqs: make(map[string]int),
-	}
-
-	// STEP 3: Index each token and track term frequencies
-	for position, token := range tokens {
-		idx.indexToken(token, docID, position)
-		docStats.TermFreqs[token]++
-	}
-
-	// STEP 4: Update global statistics
-	idx.DocStats[docID] = docStats
-	idx.TotalDocs++
-	idx.TotalTerms += int64(len(tokens))
+	slog.Info("indexing document", slog.Uint64("docID", uint64(docID)))
+	idx.indexDocumentUnlocked(docID, document, applyIndexOptions(opts))
 }
 
 // indexToken adds a single token occurrence to the index (HYBRID STORAGE)
-//
-// HOW IT WORKS:
-// -------------
-// 1. Update Roaring Bitmap (document-level)
-//   - Set the bit for this document ID
-//   - Enables fast document lookups and boolean operations
-//   - Compressed storage (10-100x smaller than skip lists alone)
-//
-// 2. Update Skip List (position-level)
-//   - Insert exact position (docID, offset)
-//   - Enables phrase search and proximity ranking
-//   - Maintains all position information
-//
-// 3. Best of both worlds!
-//   - Fast document queries via bitmaps
-//   - Detailed position queries via skip lists
-//
-// DocumentID and Offset are stored as ints
-// - The SkipList uses sentinel values (BOF=MinInt, EOF=MaxInt) to mark boundaries
-// - All position values are integers (no casting needed)
-func (idx *InvertedIndex) indexToken(token string, docID, position int) {
-	// STEP 1: Update roaring bitmap (document-level)
-	// Create bitmap if this is the first time seeing this token
+func (idx *InvertedIndex) indexToken(token string, docID uint32, position int) {
+	// Update roaring bitmap (document-level)
 	if idx.DocBitmaps[token] == nil {
 		idx.DocBitmaps[token] = roaring.NewBitmap()
 	}
-	// Set the bit for this document ID
-	idx.DocBitmaps[token].Add(uint32(docID))
+	idx.DocBitmaps[token].Add(docID)
 
-	// STEP 2: Update skip list (position-level)
-	// Check if this token already has a posting list
+	// Update skip list (position-level)
 	skipList, exists := idx.getPostingList(token)
 	if !exists {
-		// First time seeing this token - create a new SkipList
 		skipList = *NewSkipList()
 	}
-
-	// Add this occurrence to the token's posting list
 	skipList.Insert(Position{
-		DocumentID: docID,    // Which document?
-		Offset:     position, // Where in the document?
+		DocumentID: docID,
+		Offset:     position,
 	})
-
-	// Save the updated SkipList back to the map
-	// (In Go, maps don't update automatically when you modify a struct value)
 	idx.PostingsList[token] = skipList
 }
 
 // getPostingList retrieves the posting list for a token
-//
-// This is a simple helper to avoid repeating map lookup code.
-// Returns (skipList, true) if found, (empty, false) if not found.
 func (idx *InvertedIndex) getPostingList(token string) (SkipList, bool) {
 	skipList, exists := idx.PostingsList[token]
 	return skipList, exists
@@ -297,139 +190,88 @@ func (idx *InvertedIndex) getPostingList(token string) (SkipList, bool) {
 // ═══════════════════════════════════════════════════════════════════════════════
 // BASIC SEARCH OPERATIONS
 // ═══════════════════════════════════════════════════════════════════════════════
-// These four methods (First, Last, Next, Previous) form the foundation of
-// all search operations. Everything else is built on top of these primitives.
-//
-// Think of them like iterator operations:
-// - First: Go to the beginning
-// - Last: Go to the end
-// - Next: Move forward
-// - Previous: Move backward
-// ═══════════════════════════════════════════════════════════════════════════════
 
 // First returns the first occurrence of a token in the index
-//
-// EXAMPLE:
-// --------
-// Given: "quick" appears at [Doc1:Pos1, Doc3:Pos0, Doc5:Pos2]
-// First("quick") returns Doc3:Pos0 (the earliest occurrence)
-//
-// Use case: Start searching for a token from the beginning
 func (idx *InvertedIndex) First(token string) (Position, error) {
 	skipList, exists := idx.getPostingList(token)
 	if !exists {
 		return EOFDocument, ErrNoPostingList
 	}
-
-	// The first position is at the bottom level (level 0) of the SkipList
-	// The Head node points to the first real node via Tower[0]
 	return skipList.Head.Tower[0].Key, nil
 }
 
 // Last returns the last occurrence of a token in the index
-//
-// EXAMPLE:
-// --------
-// Given: "quick" appears at [Doc1:Pos1, Doc3:Pos0, Doc5:Pos2]
-// Last("quick") returns Doc5:Pos2 (the latest occurrence)
-//
-// Use case: Search backwards from the end
 func (idx *InvertedIndex) Last(token string) (Position, error) {
 	skipList, exists := idx.getPostingList(token)
 	if !exists {
 		return EOFDocument, ErrNoPostingList
 	}
-
-	// Traverse to the end of the SkipList
 	return skipList.Last(), nil
 }
 
 // Next finds the next occurrence of a token after the given position
-//
-// EXAMPLE:
-// --------
-// Given: "brown" appears at [Doc1:Pos2, Doc3:Pos1, Doc3:Pos5, Doc5:Pos0]
-// Next("brown", Doc3:Pos1) returns Doc3:Pos5
-// Next("brown", Doc3:Pos5) returns Doc5:Pos0
-// Next("brown", Doc5:Pos0) returns EOF (no more occurrences)
-//
-// Special cases:
-// - If currentPos is BOF (beginning of file), return First
-// - If currentPos is already EOF (end of file), stay at EOF
-//
-// Use case: Iterate through all occurrences of a word
 func (idx *InvertedIndex) Next(token string, currentPos Position) (Position, error) {
-	// Special case: Starting from the beginning
 	if currentPos.IsBeginning() {
 		return idx.First(token)
 	}
-
-	// Special case: Already at the end
 	if currentPos.IsEnd() {
 		return EOFDocument, nil
 	}
 
-	// Get the posting list for this token
 	skipList, exists := idx.getPostingList(token)
 	if !exists {
 		return EOFDocument, ErrNoPostingList
 	}
 
-	// Find the next position after currentPos in the SkipList
-	// FindGreaterThan returns the smallest position > currentPos
 	nextPos, _ := skipList.FindGreaterThan(currentPos)
 	return nextPos, nil
 }
 
 // Previous finds the previous occurrence of a token before the given position
-//
-// EXAMPLE:
-// --------
-// Given: "brown" appears at [Doc1:Pos2, Doc3:Pos1, Doc3:Pos5, Doc5:Pos0]
-// Previous("brown", Doc5:Pos0) returns Doc3:Pos5
-// Previous("brown", Doc3:Pos5) returns Doc3:Pos1
-// Previous("brown", Doc1:Pos2) returns BOF (no earlier occurrences)
-//
-// Use case: Search backwards through occurrences
 func (idx *InvertedIndex) Previous(token string, currentPos Position) (Position, error) {
-	// Special case: Starting from the end
 	if currentPos.IsEnd() {
 		return idx.Last(token)
 	}
-
-	// Special case: Already at the beginning
 	if currentPos.IsBeginning() {
 		return BOFDocument, nil
 	}
 
-	// Get the posting list for this token
 	skipList, exists := idx.getPostingList(token)
 	if !exists {
 		return BOFDocument, ErrNoPostingList
 	}
 
-	// Find the previous position before currentPos in the SkipList
-	// FindLessThan returns the largest position < currentPos
 	prevPos, _ := skipList.FindLessThan(currentPos)
 	return prevPos, nil
 }
 
-// Upsert inserts a new document into the index or replaces the existing one
-// for the given document ID. The operation updates postings, bitmaps,
-// and BM25-related document statistics atomically under the index lock.
-func (idx *InvertedIndex) Upsert(docID int, document string) {
+// ═══════════════════════════════════════════════════════════════════════════════
+// UPSERT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Upsert inserts a new document or replaces the existing one for the given docID.
+//
+// Accepts the same options as Index — in particular WithoutAnalyzer() to bypass
+// the analysis pipeline and store the document text verbatim.
+//
+// Example (default):
+//
+//	idx.Upsert(42, "updated document text")
+//
+// Example (raw):
+//
+//	idx.Upsert(42, "SKU-9021-XL", iskra.WithoutAnalyzer())
+func (idx *InvertedIndex) Upsert(docID uint32, document string, opts ...IndexOption) {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 
-	idx.removeDocumentUnlocked(docID) // idempotent operation
-	idx.indexDocumentUnlocked(docID, document)
+	idx.removeDocumentUnlocked(docID)
+	idx.indexDocumentUnlocked(docID, document, applyIndexOptions(opts))
 }
 
-// removeDocumentUnlocked removes all indexed data associated with the given
-// document ID, including postings, bitmaps, and BM25 statistics.
-// The caller must hold idx.mutex
-// It returns false if the document is not present in the index.
-func (idx *InvertedIndex) removeDocumentUnlocked(docID int) bool {
+// removeDocumentUnlocked removes all indexed data for a document.
+// Caller must hold idx.mu.
+func (idx *InvertedIndex) removeDocumentUnlocked(docID uint32) bool {
 	stats, ok := idx.DocStats[docID]
 	if !ok {
 		return false
@@ -445,11 +287,17 @@ func (idx *InvertedIndex) removeDocumentUnlocked(docID int) bool {
 	return true
 }
 
-// indexDocumentUnlocked tokenizes and indexes the document content, updates
-// per-term postings, document bitmaps, and BM25 document statistics.
-// The caller must hold idx.mu.
-func (idx *InvertedIndex) indexDocumentUnlocked(docID int, document string) {
-	tokens := Analyze(document)
+// indexDocumentUnlocked tokenizes (or not) and indexes the document.
+// Caller must hold idx.mu.
+func (idx *InvertedIndex) indexDocumentUnlocked(docID uint32, document string, o indexOptions) {
+	var tokens []string
+	if o.disableAnalyzer {
+		// Store the raw document as a single token so it can still be looked up.
+		// A single-element slice preserves the position-based machinery unchanged.
+		tokens = []string{document}
+	} else {
+		tokens = Analyze(document)
+	}
 
 	docStats := DocumentStats{
 		DocID:     docID,
@@ -467,10 +315,8 @@ func (idx *InvertedIndex) indexDocumentUnlocked(docID int, document string) {
 	idx.TotalTerms += int64(len(tokens))
 }
 
-// removeDocumentPostingsForTerm removes all positional entries of the given
-// term for the specified document ID. If the term no longer has postings,
-// the corresponding posting list and bitmap are removed as well.
-func (idx *InvertedIndex) removeDocumentPostingsForTerm(term string, docID int) {
+// removeDocumentPostingsForTerm removes all positional entries of a term for a doc.
+func (idx *InvertedIndex) removeDocumentPostingsForTerm(term string, docID uint32) {
 	skipList, exists := idx.PostingsList[term]
 	if !exists {
 		return
@@ -498,8 +344,9 @@ func (idx *InvertedIndex) removeDocumentPostingsForTerm(term string, docID int) 
 	}
 
 	idx.PostingsList[term] = skipList
+
 	if bm := idx.DocBitmaps[term]; bm != nil {
-		bm.Remove(uint32(docID))
+		bm.Remove(docID)
 		if bm.IsEmpty() {
 			delete(idx.DocBitmaps, term)
 		}
