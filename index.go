@@ -269,6 +269,31 @@ func (idx *InvertedIndex) Upsert(docID uint32, document string, opts ...IndexOpt
 	idx.indexDocumentUnlocked(docID, document, applyIndexOptions(opts))
 }
 
+// Delete removes a document from the index
+//
+// All positional entries, bitmaps bits, BM25 statistics, and DocStats for
+// the given docID are cleaned up automatically under the index lock.
+// Terms that have no remaining postings after the removal are pruned
+// from both PostingsList and DocBitmaps, keeping the index compact.
+//
+// Returns true if the document existed and was removed, false if it was not
+// present in the index.
+//
+// Example:
+//
+// removed := idx.Delete(42)
+//
+//	if !removed {
+//	  log.Println("document 42 was not in the index")
+//	}
+func (idx *InvertedIndex) Delete(docID uint32) bool {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	slog.Info("deleting document", slog.Uint64("docID", uint64(docID)))
+	return idx.removeDocumentUnlocked(docID)
+}
+
 // removeDocumentUnlocked removes all indexed data for a document.
 // Caller must hold idx.mu.
 func (idx *InvertedIndex) removeDocumentUnlocked(docID uint32) bool {
